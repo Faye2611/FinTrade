@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import threading
 import time
 import os
+import json
 
 # ====================== DATABASE SETUP ======================
 DB_PATH = 'fintrade.db'
@@ -53,6 +54,23 @@ def init_db():
         # Cash table
         c.execute('''CREATE TABLE IF NOT EXISTS cash (id INTEGER PRIMARY KEY, amount REAL)''')
         c.execute("INSERT OR IGNORE INTO cash (id, amount) VALUES (1, 100000.0)")
+
+        # Backtest runs table
+        c.execute('''CREATE TABLE IF NOT EXISTS backtest_runs
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      run_timestamp TEXT,
+                      symbol TEXT,
+                      start_date TEXT,
+                      end_date TEXT,
+                      initial_cash REAL,
+                      final_value REAL,
+                      strategy_return REAL,
+                      buy_hold_return REAL,
+                      max_drawdown REAL,
+                      number_of_trades INTEGER,
+                      spread_bps REAL,
+                      commission REAL,
+                      trades_json TEXT)''')
         
         conn.commit()
     return True
@@ -107,6 +125,27 @@ def get_trade_history():
     """Fetches trade history dataframe safely."""
     with get_db_connection() as conn:
         return pd.read_sql_query("SELECT * FROM trade_history ORDER BY timestamp DESC", conn)
+
+def save_backtest_run(result, start_date, end_date):
+    """Stores one completed backtest run in the database."""
+    trades_serializable = [
+        {**t, "date": str(t["date"])} for t in result["trades"]
+    ]
+    with get_db_connection() as conn:
+        conn.execute(
+            '''INSERT INTO backtest_runs
+               (run_timestamp, symbol, start_date, end_date, initial_cash,
+                final_value, strategy_return, buy_hold_return, max_drawdown,
+                number_of_trades, spread_bps, commission, trades_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (datetime.now().isoformat(timespec="seconds"),
+             result["symbol"], str(start_date), str(end_date),
+             result["initial_cash"], result["final_value"],
+             result["strategy_return"], result["buy_hold_return"],
+             result["max_drawdown"], result["number_of_trades"],
+             SPREAD_BPS, COMMISSION_FLAT, json.dumps(trades_serializable))
+        )
+        conn.commit()
 
 def get_pending_orders():
     """Fetches active pending orders safely."""
@@ -284,6 +323,253 @@ def generate_decision_signal(hist_data):
         "explanation": explanation
     }
 
+# ====================== BACKTEST ENGINE ======================
+
+def run_backtest(symbol, start_date, end_date, initial_cash=100000):
+    """
+    Backtests the existing technical decision strategy.
+
+    Signals are generated using information available at the end
+    of each trading day and executed at the next day's opening price.
+    This avoids using future information.
+    """
+
+    try:
+        # Get extra historical data before start_date so that
+        # SMA-200 and 3-month momentum can be calculated.
+        warmup_start = pd.to_datetime(start_date) - timedelta(days=300)
+
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(
+            start=warmup_start,
+            end=pd.to_datetime(end_date) + timedelta(days=1)
+        )
+
+        if df.empty:
+            return None
+
+        # ====================== INDICATORS ======================
+
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+
+        delta = df['Close'].diff()
+
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+
+        rs = avg_gain / avg_loss
+        df['RSI_14'] = 100 - (100 / (1 + rs))
+
+        df['Momentum_3M'] = df['Close'].pct_change(periods=63) * 100
+
+        # Remove dates before requested backtest period.
+        df = df[
+            df.index >= pd.Timestamp(start_date).tz_localize(df.index.tz)
+        ]
+
+        if len(df) < 2:
+            return None
+
+        # ====================== BACKTEST VARIABLES ======================
+
+        cash = float(initial_cash)
+        shares = 0.0
+
+        trades = []
+        portfolio_history = []
+
+        # ====================== DAILY SIMULATION ======================
+
+        for i in range(len(df) - 1):
+
+            current_day = df.iloc[i]
+            next_day = df.iloc[i + 1]
+
+            # Skip until all indicators are available.
+            if (
+                pd.isna(current_day['SMA_50']) or
+                pd.isna(current_day['SMA_200']) or
+                pd.isna(current_day['RSI_14']) or
+                pd.isna(current_day['Momentum_3M'])
+            ):
+                continue
+
+            # Create a dataframe containing ONLY information
+            # available up to the current day.
+            historical_until_today = df.iloc[:i + 1]
+
+            signal_data = generate_decision_signal(
+                historical_until_today
+            )
+
+            if signal_data is None:
+                continue
+
+            signal = signal_data["signal"]
+
+            # Execute on NEXT day's opening price.
+            raw_price = float(next_day['Open'])
+
+            if pd.isna(raw_price) or raw_price <= 0:
+                continue
+
+            # ====================== BUY ======================
+
+            if signal == "BUY" and shares == 0:
+
+                # Use 95% of available cash.
+                investment = cash * 0.95
+
+                execution_price = round(
+                    raw_price * (1 + SPREAD_BPS),
+                    4
+                )
+
+                quantity = int(
+                    (investment - COMMISSION_FLAT)
+                    / execution_price
+                )
+
+                if quantity > 0:
+
+                    total_cost = (
+                        quantity * execution_price
+                    ) + COMMISSION_FLAT
+
+                    if total_cost <= cash:
+
+                        cash -= total_cost
+                        shares = quantity
+
+                        trades.append({
+                            "date": next_day.name,
+                            "action": "BUY",
+                            "price": execution_price,
+                            "quantity": quantity,
+                            "fee": COMMISSION_FLAT
+                        })
+
+            # ====================== SELL ======================
+
+            elif signal == "SELL" and shares > 0:
+
+                execution_price = round(
+                    raw_price * (1 - SPREAD_BPS),
+                    4
+                )
+
+                total_proceeds = (
+                    shares * execution_price
+                ) - COMMISSION_FLAT
+
+                cash += total_proceeds
+
+                trades.append({
+                    "date": next_day.name,
+                    "action": "SELL",
+                    "price": execution_price,
+                    "quantity": shares,
+                    "fee": COMMISSION_FLAT
+                })
+
+                shares = 0
+
+            # ====================== PORTFOLIO VALUE ======================
+
+            portfolio_value = (
+                cash + shares * float(next_day['Close'])
+            )
+
+            portfolio_history.append({
+                "date": next_day.name,
+                "portfolio_value": portfolio_value
+            })
+
+        # ====================== CLOSE REMAINING POSITION ======================
+
+        if shares > 0:
+
+            final_price = float(df.iloc[-1]['Close'])
+
+            execution_price = round(
+                final_price * (1 - SPREAD_BPS),
+                4
+            )
+
+            cash += (
+                shares * execution_price
+            ) - COMMISSION_FLAT
+
+            trades.append({
+                "date": df.index[-1],
+                "action": "FINAL SELL",
+                "price": execution_price,
+                "quantity": shares,
+                "fee": COMMISSION_FLAT
+            })
+
+            shares = 0
+
+        # ====================== RESULTS ======================
+
+        final_value = cash
+
+        strategy_return = (
+            (final_value - initial_cash)
+            / initial_cash
+        ) * 100
+
+        # Buy-and-hold benchmark.
+        first_price = float(df.iloc[0]['Close'])
+        last_price = float(df.iloc[-1]['Close'])
+
+        buy_hold_return = (
+            (last_price - first_price)
+            / first_price
+        ) * 100
+
+        # Maximum drawdown.
+        history_df = pd.DataFrame(portfolio_history)
+
+        if not history_df.empty:
+
+            history_df['peak'] = (
+                history_df['portfolio_value']
+                .cummax()
+            )
+
+            history_df['drawdown'] = (
+                (history_df['portfolio_value']
+                 - history_df['peak'])
+                / history_df['peak']
+            ) * 100
+
+            max_drawdown = history_df['drawdown'].min()
+
+        else:
+            max_drawdown = 0
+
+        return {
+            "symbol": symbol,
+            "initial_cash": initial_cash,
+            "final_value": final_value,
+            "strategy_return": strategy_return,
+            "buy_hold_return": buy_hold_return,
+            "max_drawdown": max_drawdown,
+            "number_of_trades": len(trades),
+            "trades": trades,
+            "portfolio_history": history_df
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
+
 # ====================== EXECUTION MECHANICS ENGINE ======================
 def process_instant_trade(symbol, action, order_type, quantity, raw_price):
     """Applies slippage/spread & fees, then updates positions immediately."""
@@ -448,7 +734,16 @@ initialize_brokerage_engine()
 st.set_page_config(page_title="FinTrade Paper Trader Pro", layout="wide")
 st.title("FinTrade Paper Trader - Advanced Simulation Engine")
 
-page = st.sidebar.selectbox("Go to", ["Dashboard", "Trade & Orders", "Portfolio Analysis", "History"])
+page = st.sidebar.selectbox(
+    "Go to",
+    [
+        "Dashboard",
+        "Trade & Orders",
+        "Portfolio Analysis",
+        "Backtest",
+        "History"
+    ]
+)
 
 # ====================== DASHBOARD ======================
 if page == "Dashboard":
@@ -639,6 +934,193 @@ elif page == "Portfolio Analysis":
     else:
         st.info("No holdings yet.")
 
+# ====================== BACKTEST ======================
+elif page == "Backtest":
+
+    st.header("📈 Historical Strategy Backtest")
+
+    st.write(
+        "Test the FinTrade technical decision strategy against "
+        "historical market data without changing your live paper-trading portfolio."
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        backtest_symbol = st.text_input(
+            "Stock Symbol",
+            value="AAPL"
+        ).upper().strip()
+
+    with col2:
+        initial_capital = st.number_input(
+            "Starting Capital ($)",
+            min_value=1000.0,
+            value=100000.0,
+            step=1000.0
+        )
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        start_date = st.date_input(
+            "Backtest Start Date",
+            value=datetime(2024, 1, 1)
+        )
+
+    with col4:
+        end_date = st.date_input(
+            "Backtest End Date",
+            value=datetime(2025, 12, 31)
+        )
+
+    st.info(
+        "Signals are generated using historical information available "
+        "at each date and executed at the following day's opening price. "
+        "Simulated spread and transaction fees are included."
+    )
+
+    if st.button(
+        "▶ Run Backtest",
+        type="primary",
+        width='stretch'
+    ):
+
+        if start_date >= end_date:
+            st.error("Start date must be before the end date.")
+
+        elif not backtest_symbol:
+            st.error("Please enter a stock symbol.")
+
+        else:
+
+            with st.spinner(
+                f"Running historical backtest for {backtest_symbol}..."
+            ):
+
+                result = run_backtest(
+                    backtest_symbol,
+                    start_date,
+                    end_date,
+                    initial_capital
+                )
+
+            if result is None:
+
+                st.error(
+                    "Could not retrieve sufficient historical data."
+                )
+
+            elif "error" in result:
+
+                st.error(
+                    f"Backtest failed: {result['error']}"
+                )
+
+            else:
+
+                st.success(
+                    f"Backtest completed for {result['symbol']}"
+                )
+                save_backtest_run(result, start_date, end_date)
+
+                # ====================== PERFORMANCE METRICS ======================
+
+                st.subheader("Performance Summary")
+
+                metric1, metric2, metric3, metric4 = st.columns(4)
+
+                metric1.metric(
+                    "Final Portfolio",
+                    f"${result['final_value']:,.2f}"
+                )
+
+                metric2.metric(
+                    "Strategy Return",
+                    f"{result['strategy_return']:.2f}%"
+                )
+
+                metric3.metric(
+                    "Buy & Hold Return",
+                    f"{result['buy_hold_return']:.2f}%"
+                )
+
+                metric4.metric(
+                    "Max Drawdown",
+                    f"{result['max_drawdown']:.2f}%"
+                )
+
+                st.metric(
+                    "Total Trades",
+                    result["number_of_trades"]
+                )
+
+                # ====================== EQUITY CURVE ======================
+
+                history_df = result["portfolio_history"]
+
+                if not history_df.empty:
+
+                    st.subheader("Portfolio Value Over Time")
+
+                    fig = go.Figure()
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=history_df["date"],
+                            y=history_df["portfolio_value"],
+                            mode="lines",
+                            name="Strategy Portfolio"
+                        )
+                    )
+
+                    fig.add_hline(
+                        y=initial_capital,
+                        line_dash="dash",
+                        annotation_text="Starting Capital"
+                    )
+
+                    fig.update_layout(
+                        xaxis_title="Date",
+                        yaxis_title="Portfolio Value ($)",
+                        hovermode="x unified"
+                    )
+
+                    st.plotly_chart(
+                        fig,
+                        width='stretch'
+                    )
+
+                # ====================== TRADE HISTORY ======================
+
+                if result["trades"]:
+
+                    st.subheader("Backtest Trade History")
+
+                    trades_df = pd.DataFrame(
+                        result["trades"]
+                    )
+
+                    st.dataframe(
+                        trades_df,
+                        width='stretch'
+                    )
+
+    with st.expander("Past backtest runs"):
+        with get_db_connection() as conn:
+            runs_df = pd.read_sql_query(
+                '''SELECT run_timestamp, symbol, start_date, end_date,
+                          strategy_return, buy_hold_return, max_drawdown,
+                          number_of_trades
+                   FROM backtest_runs ORDER BY id DESC''', conn)
+        if runs_df.empty:
+            st.info("No backtest runs recorded yet.")
+        else:
+            st.dataframe(runs_df, width='stretch')
+            st.download_button("Download as CSV",
+                               runs_df.to_csv(index=False),
+                               "backtest_runs.csv", "text/csv")
+                    
 # ====================== HISTORY ======================
 elif page == "History":
     st.header("Trade Log Records")
