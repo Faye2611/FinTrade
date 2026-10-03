@@ -11,3 +11,5 @@ Key features
 
 Tech
 - Python, Streamlit, SQLite, yfinance, etc. 
+
+Run instruction for command prompt: streamlit run app.py
